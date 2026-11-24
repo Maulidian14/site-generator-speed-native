@@ -8,7 +8,7 @@ import { setFlagsFromString } from 'node:v8';
 // V8's incremental marking off, and its optimising compiler off too, set before
 // solve.js is imported (the rules allow an entry to tune V8's flags this way). This
 // program runs once per container: the JS side lives a few milliseconds (the real
-// work is the addon's C render, ~100 ms locally), so the optimising compiler's
+// work is the addon's C render, ~67 ms locally), so the optimising compiler's
 // background threads cost more CPU than the faster code they produce ever pays
 // back, and every thread's CPU counts against the entry.
 setFlagsFromString('--no-opt --no-incremental-marking');

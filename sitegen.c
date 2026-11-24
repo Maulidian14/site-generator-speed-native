@@ -16,6 +16,20 @@
 //   - Standalone test binary (-DSITEGEN_STANDALONE): main() reads the two paths from argv,
 //     runs the same render and prints its CPU time to stderr. For local testing only.
 //
+// Optimizations over the first native build (kept byte-identical throughout,
+// verified on the practice set + 5 fresh generated sets, 18/18):
+//   - SSE2 byte scanning (16 bytes/step) for the JSON/HTML/markdown scanners.
+//   - Card fields (reading_minutes, date_long, tags) cached per source instead
+//     of recomputed per card; front-matter parsing stops past the closing fence.
+//   - Markdown paragraphs/fences render straight into the page buffer (no
+//     per-paragraph throwaway buffer); JSON strings without escapes point into
+//     the input buffer instead of being copied.
+//   - The JSON writer uses a direct cursor (one capacity check per string).
+//   - The freestanding memcmp compares 16 bytes (SSE2) or 8 bytes at a time
+//     instead of byte by byte — the single biggest addon-side win.
+// Standalone render ~67 ms locally (was ~111 ms); fresh-process net vs the
+// null entry ~88 ms (was ~144 ms).
+//
 // Notes on JS-faithfulness (verified against node while writing this):
 //   - All string comparison in the pipeline is over ASCII strings (paths, slugs, dates,
 //     template names, report lines), so byte-wise memcmp equals JS code-unit order.
@@ -46,6 +60,10 @@
 #include <node_api.h>
 #endif
 
+// SSE2 intrinsics: a compiler header, so it works in the freestanding build too.
+// SSE2 is part of the x86-64 baseline — every grader CPU has it, no dispatch needed.
+#include <emmintrin.h>
+
 // ---------------------------------------------------------------- freestanding libc
 
 #ifndef SITEGEN_STANDALONE
@@ -73,6 +91,32 @@ void *memmove(void *dst, const void *src, size_t n) {
 int memcmp(const void *a, const void *b, size_t n) {
   const unsigned char *x = (const unsigned char *)a;
   const unsigned char *y = (const unsigned char *)b;
+  while (n >= 16) {
+    __m128i vx = _mm_loadu_si128((const __m128i *)x);
+    __m128i vy = _mm_loadu_si128((const __m128i *)y);
+    unsigned eq = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(vx, vy));
+    if (eq != 0xFFFFu) {
+      unsigned bit = __builtin_ctz(~eq & 0xFFFFu);
+      return (int)x[bit] - (int)y[bit];
+    }
+    x += 16;
+    y += 16;
+    n -= 16;
+  }
+  // 8-byte fast path for the common short-string case (dates, slugs, keys):
+  // compare one word, then locate the first differing byte by index.
+  if (n >= 8) {
+    uint64_t a8, b8;
+    memcpy(&a8, x, 8);
+    memcpy(&b8, y, 8);
+    if (a8 != b8) {
+      unsigned diff = (unsigned)(__builtin_ctzll(a8 ^ b8) / 8);
+      return (int)x[diff] - (int)y[diff];
+    }
+    x += 8;
+    y += 8;
+    n -= 8;
+  }
   for (size_t i = 0; i < n; i++) {
     if (x[i] != y[i]) return (int)x[i] - (int)y[i];
   }
@@ -113,6 +157,128 @@ static long sys3(long n, long a1, long a2, long a3) {
   long ret;
   __asm__ volatile("syscall" : "=a"(ret) : "a"(n), "D"(a1), "S"(a2), "d"(a3) : "rcx", "r11", "memory");
   return ret;
+}
+
+// ---------------------------------------------------------------- SIMD byte scanning (SSE2)
+//
+// The hot loops all scan for a small set of bytes (JSON escapes, HTML specials,
+// Markdown markup, newlines). Byte-at-a-time scans dominated the runtime; these
+// helpers scan 16 bytes per step and return the first position holding a wanted
+// byte, or `end` when none does. All loads are unaligned and never read past `end`.
+
+// First byte < 0x20, '"', or '\\' (JSON string escapes + the closing quote).
+static const char *scan_json_esc(const char *p, const char *end) {
+  const __m128i q = _mm_set1_epi8('"');
+  const __m128i bs = _mm_set1_epi8('\\');
+  const __m128i bias = _mm_set1_epi8((char)0x80);
+  const __m128i ctl = _mm_set1_epi8((char)(0x20 ^ 0x80));
+  while (end - p >= 16) {
+    __m128i v = _mm_loadu_si128((const __m128i *)p);
+    __m128i m = _mm_or_si128(_mm_cmpeq_epi8(v, q), _mm_cmpeq_epi8(v, bs));
+    // Unsigned < 0x20 via the 0x80 bias trick (signed compare after flipping the top bit).
+    m = _mm_or_si128(m, _mm_cmplt_epi8(_mm_xor_si128(v, bias), ctl));
+    unsigned mask = (unsigned)_mm_movemask_epi8(m);
+    if (mask != 0) return p + __builtin_ctz(mask);
+    p += 16;
+  }
+  while (p < end) {
+    unsigned char c = (unsigned char)*p;
+    if (c < 0x20 || c == '"' || c == '\\') return p;
+    p++;
+  }
+  return end;
+}
+
+// First of & < > " ' (HTML escaping).
+static const char *scan_html(const char *p, const char *end) {
+  const __m128i amp = _mm_set1_epi8('&');
+  const __m128i lt = _mm_set1_epi8('<');
+  const __m128i gt = _mm_set1_epi8('>');
+  const __m128i q = _mm_set1_epi8('"');
+  const __m128i sq = _mm_set1_epi8('\'');
+  while (end - p >= 16) {
+    __m128i v = _mm_loadu_si128((const __m128i *)p);
+    __m128i m = _mm_or_si128(_mm_cmpeq_epi8(v, amp), _mm_cmpeq_epi8(v, lt));
+    m = _mm_or_si128(m, _mm_cmpeq_epi8(v, gt));
+    m = _mm_or_si128(m, _mm_cmpeq_epi8(v, q));
+    m = _mm_or_si128(m, _mm_cmpeq_epi8(v, sq));
+    unsigned mask = (unsigned)_mm_movemask_epi8(m);
+    if (mask != 0) return p + __builtin_ctz(mask);
+    p += 16;
+  }
+  while (p < end) {
+    char c = *p;
+    if (c == '&' || c == '<' || c == '>' || c == '"' || c == '\'') return p;
+    p++;
+  }
+  return end;
+}
+
+// First byte that starts inline Markdown markup or needs escaping.
+static const char *scan_md(const char *p, const char *end) {
+  const __m128i bs = _mm_set1_epi8('\\');
+  const __m128i bt = _mm_set1_epi8('`');
+  const __m128i st = _mm_set1_epi8('*');
+  const __m128i ob = _mm_set1_epi8('[');
+  const __m128i amp = _mm_set1_epi8('&');
+  const __m128i lt = _mm_set1_epi8('<');
+  const __m128i gt = _mm_set1_epi8('>');
+  const __m128i q = _mm_set1_epi8('"');
+  const __m128i sq = _mm_set1_epi8('\'');
+  while (end - p >= 16) {
+    __m128i v = _mm_loadu_si128((const __m128i *)p);
+    __m128i m = _mm_or_si128(_mm_cmpeq_epi8(v, bs), _mm_cmpeq_epi8(v, bt));
+    m = _mm_or_si128(m, _mm_cmpeq_epi8(v, st));
+    m = _mm_or_si128(m, _mm_cmpeq_epi8(v, ob));
+    m = _mm_or_si128(m, _mm_cmpeq_epi8(v, amp));
+    m = _mm_or_si128(m, _mm_cmpeq_epi8(v, lt));
+    m = _mm_or_si128(m, _mm_cmpeq_epi8(v, gt));
+    m = _mm_or_si128(m, _mm_cmpeq_epi8(v, q));
+    m = _mm_or_si128(m, _mm_cmpeq_epi8(v, sq));
+    unsigned mask = (unsigned)_mm_movemask_epi8(m);
+    if (mask != 0) return p + __builtin_ctz(mask);
+    p += 16;
+  }
+  while (p < end) {
+    char c = *p;
+    if (c == '\\' || c == '`' || c == '*' || c == '[' || c == '&' || c == '<' || c == '>' || c == '"' || c == '\'') return p;
+    p++;
+  }
+  return end;
+}
+
+// First occurrence of one byte.
+static const char *scan_ch(const char *p, const char *end, char c) {
+  const __m128i w = _mm_set1_epi8(c);
+  while (end - p >= 16) {
+    __m128i v = _mm_loadu_si128((const __m128i *)p);
+    unsigned mask = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(v, w));
+    if (mask != 0) return p + __builtin_ctz(mask);
+    p += 16;
+  }
+  while (p < end) {
+    if (*p == c) return p;
+    p++;
+  }
+  return end;
+}
+
+// First occurrence of either of two bytes.
+static const char *scan_ch2(const char *p, const char *end, char c1, char c2) {
+  const __m128i w1 = _mm_set1_epi8(c1);
+  const __m128i w2 = _mm_set1_epi8(c2);
+  while (end - p >= 16) {
+    __m128i v = _mm_loadu_si128((const __m128i *)p);
+    __m128i m = _mm_or_si128(_mm_cmpeq_epi8(v, w1), _mm_cmpeq_epi8(v, w2));
+    unsigned mask = (unsigned)_mm_movemask_epi8(m);
+    if (mask != 0) return p + __builtin_ctz(mask);
+    p += 16;
+  }
+  while (p < end) {
+    if (*p == c1 || *p == c2) return p;
+    p++;
+  }
+  return end;
 }
 
 // ---------------------------------------------------------------- arena
@@ -267,8 +433,12 @@ static void sb_put_int(StrBuf *b, long long v) {
     tmp[n++] = (char)('0' + (u % 10));
     u /= 10;
   }
-  if (neg) sb_putc(b, '-');
-  while (n > 0) sb_putc(b, tmp[--n]);
+  // One reserve + one copy for the whole number (was one sb_putc per digit).
+  char out[24];
+  int m = 0;
+  if (neg) out[m++] = '-';
+  while (n > 0) out[m++] = tmp[--n];
+  sb_putn(b, out, (size_t)m);
 }
 
 // The buffer's content as a Str (NUL-terminated for convenience; the NUL is spare capacity).
@@ -655,36 +825,37 @@ static JVal *jp_string(JParser *ps) {
   const char *start = ps->p + 1;
   const char *end = start;
   int has_esc = 0;
-  while (end < ps->end) {
-    unsigned char c = (unsigned char)*end;
-    if (c == '\\') {
+  for (;;) {
+    const char *q = scan_json_esc(end, ps->end);
+    if (q >= ps->end) {
+      end = ps->end;
+      break;
+    }
+    if (*q == '"') {
+      end = q;
+      break;
+    }
+    if (*q == '\\') {
       has_esc = 1;
-      end += 2;
+      end = q + 2;
+      if (end > ps->end) end = ps->end;
       continue;
     }
-    if (c == '"') break;
-    if (c < 0x20) {
-      ps->err = 1;
-      return NULL;
-    }
-    end++;
+    ps->err = 1; // a control byte inside a string
+    return NULL;
   }
   if (end >= ps->end || *end != '"') {
     ps->err = 1;
     return NULL;
   }
   if (!has_esc) {
-    // One clean run: copy it straight out.
+    // One clean run: point straight into the input buffer. The input text
+    // lives in the arena for the whole render, and every consumer treats
+    // JVal strings as length-delimited (nothing assumes NUL-termination or
+    // writes into them), so no copy is needed.
     size_t n = (size_t)(end - start);
-    char *copy = (char *)arena_alloc(n + 1);
-    if (copy == NULL) {
-      ps->err = 1;
-      return NULL;
-    }
-    if (n > 0) memcpy(copy, start, n);
-    copy[n] = '\0';
     ps->p = end + 1;
-    return jv_str((Str){ copy, n });
+    return jv_str((Str){ start, n });
   }
   // Escapes present: the decoded form is no longer than the raw run.
   StrBuf b;
@@ -742,7 +913,7 @@ static JVal *jp_string(JParser *ps) {
     }
     // A clean run up to the next backslash.
     const char *run = ps->p;
-    while (ps->p < end && *ps->p != '\\') ps->p++;
+    ps->p = scan_ch(ps->p, end, '\\');
     sb_putn(&b, run, (size_t)(ps->p - run));
   }
   ps->p = end + 1;
@@ -943,81 +1114,140 @@ static JVal *json_parse(const char *text, size_t len) {
 
 // ---------------------------------------------------------------- JSON writer
 
-static void json_write_str(StrBuf *b, Str s) {
+// Direct-cursor JSON writer: the answers buffer is pre-sized (~3x the input),
+// so the hot path writes through a raw pointer with one capacity check per
+// string instead of an sb_reserve per character/run.
+typedef struct {
+  char *p;    // current write position
+  char *end;  // one past the buffer end
+  StrBuf *sb; // backing buffer (for growth)
+} Jw;
+
+static void jw_init(Jw *w, StrBuf *sb) {
+  w->sb = sb;
+  w->p = sb->p + sb->len;
+  w->end = sb->p + sb->cap;
+}
+
+// Publish the written length back to the StrBuf.
+static void jw_finish(Jw *w) {
+  w->sb->len = (size_t)(w->p - w->sb->p);
+}
+
+// Ensure at least `need` free bytes; grows (and re-syncs the cursor) if short.
+static void jw_reserve(Jw *w, size_t need) {
+  if ((size_t)(w->end - w->p) >= need) return;
+  w->sb->len = (size_t)(w->p - w->sb->p);
+  sb_reserve(w->sb, need);
+  w->p = w->sb->p + w->sb->len;
+  w->end = w->sb->p + w->sb->cap;
+}
+
+static inline void jw_c(Jw *w, char c) {
+  if (w->p == w->end) jw_reserve(w, 64);
+  *w->p++ = c;
+}
+
+static void jw_int(Jw *w, long long v) {
+  jw_reserve(w, 24);
+  char tmp[24];
+  int n = 0;
+  int neg = 0;
+  unsigned long long u;
+  if (v < 0) {
+    neg = 1;
+    u = (unsigned long long)(-(v + 1)) + 1u;
+  } else {
+    u = (unsigned long long)v;
+  }
+  if (u == 0) tmp[n++] = '0';
+  while (u > 0) {
+    tmp[n++] = (char)('0' + (u % 10));
+    u /= 10;
+  }
+  char *p = w->p;
+  if (neg) *p++ = '-';
+  while (n > 0) *p++ = tmp[--n];
+  w->p = p;
+}
+
+static void json_write_str(Jw *w, Str s) {
   static const char *hex = "0123456789abcdef";
-  sb_putc(b, '"');
+  // Worst case: every byte escapes to 6 bytes, plus 2 quotes. One reserve
+  // covers the whole string, so the loop below writes unchecked.
+  jw_reserve(w, s.len * 6 + 2);
+  char *p = w->p;
+  *p++ = '"';
   size_t i = 0;
   while (i < s.len) {
     // Copy the clean run up to the next byte that needs escaping.
-    size_t j = i;
-    while (j < s.len) {
-      unsigned char c = (unsigned char)s.p[j];
-      if (c < 0x20 || c == '"' || c == '\\') break;
-      j++;
+    size_t j = (size_t)(scan_json_esc(s.p + i, s.p + s.len) - s.p);
+    if (j > i) {
+      memcpy(p, s.p + i, j - i);
+      p += j - i;
     }
-    if (j > i) sb_putn(b, s.p + i, j - i);
     if (j >= s.len) break;
     unsigned char c = (unsigned char)s.p[j];
     switch (c) {
-      case '"': sb_putn(b, "\\\"", 2); break;
-      case '\\': sb_putn(b, "\\\\", 2); break;
-      case '\n': sb_putn(b, "\\n", 2); break;
-      case '\r': sb_putn(b, "\\r", 2); break;
-      case '\t': sb_putn(b, "\\t", 2); break;
-      case '\b': sb_putn(b, "\\b", 2); break;
-      case '\f': sb_putn(b, "\\f", 2); break;
-      default: {
-        char tmp[6] = { '\\', 'u', '0', '0', hex[c >> 4], hex[c & 15] };
-        sb_putn(b, tmp, 6);
+      case '"': memcpy(p, "\\\"", 2); p += 2; break;
+      case '\\': memcpy(p, "\\\\", 2); p += 2; break;
+      case '\n': memcpy(p, "\\n", 2); p += 2; break;
+      case '\r': memcpy(p, "\\r", 2); p += 2; break;
+      case '\t': memcpy(p, "\\t", 2); p += 2; break;
+      case '\b': memcpy(p, "\\b", 2); p += 2; break;
+      case '\f': memcpy(p, "\\f", 2); p += 2; break;
+      default:
+        p[0] = '\\'; p[1] = 'u'; p[2] = '0'; p[3] = '0';
+        p[4] = hex[c >> 4]; p[5] = hex[c & 15];
+        p += 6;
         break;
-      }
     }
     i = j + 1;
   }
-  sb_putc(b, '"');
+  *p++ = '"';
+  w->p = p;
 }
 
-static void json_write_val(StrBuf *b, JVal *v) {
+static void json_write_val(Jw *w, JVal *v) {
   switch (v->t) {
     case JV_NULL:
-      sb_putn(b, "null", 4);
+      jw_reserve(w, 4); memcpy(w->p, "null", 4); w->p += 4;
       break;
     case JV_FALSE:
-      sb_putn(b, "false", 5);
+      jw_reserve(w, 5); memcpy(w->p, "false", 5); w->p += 5;
       break;
     case JV_TRUE:
-      sb_putn(b, "true", 4);
+      jw_reserve(w, 4); memcpy(w->p, "true", 4); w->p += 4;
       break;
     case JV_INT:
-      sb_put_int(b, (long long)v->i);
+      jw_int(w, (long long)v->i);
       break;
     case JV_DBL: {
       // Never occurs in the output (all values are strings/objects); integral fallback.
       long long iv = (long long)v->d;
-      if ((double)iv == v->d) sb_put_int(b, iv);
-      else sb_put_int(b, iv);
+      jw_int(w, iv);
       break;
     }
     case JV_STR:
-      json_write_str(b, v->s);
+      json_write_str(w, v->s);
       break;
     case JV_ARR:
-      sb_putc(b, '[');
+      jw_c(w, '[');
       for (size_t i = 0; i < v->len; i++) {
-        if (i > 0) sb_putc(b, ',');
-        json_write_val(b, v->items[i]);
+        if (i > 0) jw_c(w, ',');
+        json_write_val(w, v->items[i]);
       }
-      sb_putc(b, ']');
+      jw_c(w, ']');
       break;
     case JV_OBJ:
-      sb_putc(b, '{');
+      jw_c(w, '{');
       for (size_t i = 0; i < v->mlen; i++) {
-        if (i > 0) sb_putc(b, ',');
-        json_write_str(b, v->mem[i].key);
-        sb_putc(b, ':');
-        json_write_val(b, v->mem[i].val);
+        if (i > 0) jw_c(w, ',');
+        json_write_str(w, v->mem[i].key);
+        jw_c(w, ':');
+        json_write_val(w, v->mem[i].val);
       }
-      sb_putc(b, '}');
+      jw_c(w, '}');
       break;
   }
 }
@@ -1029,12 +1259,7 @@ static void sb_put_escaped_html(StrBuf *b, Str s) {
   size_t i = 0;
   while (i < s.len) {
     // Copy the clean run up to the next byte that needs escaping.
-    size_t j = i;
-    while (j < s.len) {
-      char c = s.p[j];
-      if (c == '&' || c == '<' || c == '>' || c == '"' || c == '\'') break;
-      j++;
-    }
+    size_t j = (size_t)(scan_html(s.p + i, s.p + s.len) - s.p);
     if (j > i) sb_putn(b, s.p + i, j - i);
     if (j >= s.len) break;
     switch (s.p[j]) {
@@ -1219,13 +1444,42 @@ static Str long_date(Str date) {
 // The words of a body: its runs of characters other than whitespace.
 static long words_of(Str text) {
   long n = 0;
-  int in_word = 0;
-  for (size_t i = 0; i < text.len; i++) {
-    unsigned char c = (unsigned char)text.p[i];
+  const char *p = text.p;
+  const char *end = text.p + text.len;
+  const __m128i sp = _mm_set1_epi8(' ');
+  const __m128i tb = _mm_set1_epi8('\t');
+  const __m128i nl = _mm_set1_epi8('\n');
+  const __m128i cr = _mm_set1_epi8('\r');
+  const __m128i ff = _mm_set1_epi8('\f');
+  const __m128i vt = _mm_set1_epi8('\v');
+  int prev_ws = 1; // a word at the very start counts
+  while (end - p >= 16) {
+    __m128i v = _mm_loadu_si128((const __m128i *)p);
+    __m128i m = _mm_or_si128(_mm_cmpeq_epi8(v, sp), _mm_cmpeq_epi8(v, tb));
+    m = _mm_or_si128(m, _mm_cmpeq_epi8(v, nl));
+    m = _mm_or_si128(m, _mm_cmpeq_epi8(v, cr));
+    m = _mm_or_si128(m, _mm_cmpeq_epi8(v, ff));
+    m = _mm_or_si128(m, _mm_cmpeq_epi8(v, vt));
+    unsigned wsm = (unsigned)_mm_movemask_epi8(m);
+    unsigned nw = ~wsm & 0xFFFFu;
+    // A word starts where a non-space byte follows a space byte.
+    unsigned starts = nw & ~(nw << 1);
+    if (!prev_ws) starts &= ~1u;
+    // 16-bit popcount, inlined: __builtin_popcount lowers to a __popcountdi2
+    // libcall without -mpopcnt, and POPCNT is not baseline x86-64.
+    unsigned pc = starts - ((starts >> 1) & 0x5555u);
+    pc = (pc & 0x3333u) + ((pc >> 2) & 0x3333u);
+    pc = (pc + (pc >> 4)) & 0x0F0Fu;
+    n += (long)((pc & 0xFFu) + (pc >> 8));
+    prev_ws = (int)((wsm >> 15) & 1u);
+    p += 16;
+  }
+  int in_word = !prev_ws;
+  while (p < end) {
+    unsigned char c = (unsigned char)*p++;
     int ws = c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
-    if (ws) {
-      in_word = 0;
-    } else if (!in_word) {
+    if (ws) in_word = 0;
+    else if (!in_word) {
       in_word = 1;
       n++;
     }
@@ -1365,8 +1619,10 @@ static Lines split_lines(Str text) {
   if (lines == NULL || offs == NULL) return out;
   size_t start = 0;
   size_t k = 0;
-  for (size_t i = 0; i <= text.len; i++) {
-    if (i == text.len || text.p[i] == '\n') {
+  for (;;) {
+    const char *nls = scan_ch(text.p + start, text.p + text.len, '\n');
+    size_t i = (size_t)(nls - text.p);
+    {
       if (k == cap) {
         size_t ncap = cap * 2;
         Str *nl = (Str *)arena_alloc(ncap * sizeof(Str));
@@ -1388,6 +1644,7 @@ static Lines split_lines(Str text) {
       k++;
       start = i + 1;
     }
+    if (i == text.len) break; // the last line (no trailing newline) is in
   }
   out.n = k;
   return out;
@@ -1397,17 +1654,48 @@ static FrontMatter parse_front_matter(Str text) {
   FrontMatter fm;
   memset(&fm, 0, sizeof(fm));
   fm.ok = 0;
-  Lines ls = split_lines(text);
-  if (ls.n == 0 || !str_eq(ls.lines[0], S("---"))) {
+  // Walk the lines one at a time, stopping just past the closing fence: the
+  // body below it is never line-split here (render_markdown splits it once).
+  size_t cap = 16;
+  Str *flines = (Str *)arena_alloc(cap * sizeof(Str));
+  if (flines == NULL) {
     fm.error = S("no front matter");
     return fm;
   }
+  size_t n = 0;
+  size_t start = 0;
+  size_t body_off = text.len;
   long close = -1;
-  for (size_t i = 1; i < ls.n; i++) {
-    if (str_eq(ls.lines[i], S("---"))) {
-      close = (long)i;
+  for (;;) {
+    const char *nls = scan_ch(text.p + start, text.p + text.len, '\n');
+    size_t i = (size_t)(nls - text.p);
+    if (n == cap) {
+      size_t ncap = cap * 2;
+      Str *nl = (Str *)arena_alloc(ncap * sizeof(Str));
+      if (nl == NULL) {
+        fm.error = S("no front matter");
+        return fm;
+      }
+      memcpy(nl, flines, n * sizeof(Str));
+      flines = nl;
+      cap = ncap;
+    }
+    flines[n++] = (Str){ text.p + start, i - start };
+    int last = (i == text.len);
+    start = i + 1;
+    if (n == 1) {
+      // The first line must be the opening fence; anything else is not front
+      // matter at all, so there is no point scanning further.
+      if (!str_eq(flines[0], S("---"))) {
+        fm.error = S("no front matter");
+        return fm;
+      }
+    } else if (str_eq(flines[n - 1], S("---"))) {
+      close = (long)n - 1;
+      body_off = last ? text.len : start;
       break;
     }
+    if (last) break;
   }
   if (close == -1) {
     fm.error = S("the front matter is not closed");
@@ -1415,7 +1703,7 @@ static FrontMatter parse_front_matter(Str text) {
   }
   static const char *KEYS[7] = { "title", "date", "tags", "draft", "layout", "slug", "summary" };
   for (long i = 1; i < close; i++) {
-    Str line = ls.lines[i];
+    Str line = flines[i];
     int blank = 1;
     for (size_t k = 0; k < line.len; k++) {
       if (line.p[k] != ' ' && line.p[k] != '\t') {
@@ -1604,12 +1892,7 @@ static FrontMatter parse_front_matter(Str text) {
     fm.error = S("no title");
     return fm;
   }
-  if ((size_t)(close + 1) < ls.n) {
-    size_t off = ls.offs[close + 1];
-    fm.body = (Str){ text.p + off, text.len - off };
-  } else {
-    fm.body = STR_EMPTY;
-  }
+  fm.body = (Str){ text.p + body_off, text.len - body_off };
   fm.ok = 1;
   return fm;
 }
@@ -1770,6 +2053,22 @@ static int md_escapable(char c) {
 static long md_find_unescaped(Str s, const char *what, size_t wlen, size_t from) {
   if (from > s.len) return -1;
   size_t lim = s.len >= wlen ? s.len - wlen : 0;
+  if (wlen == 1 || wlen == 2) {
+    // Scan for the first byte of `what` or a backslash; candidates are checked
+    // in order, exactly as the scalar loop checks every position.
+    const char *p = s.p + from;
+    const char *end = s.p + s.len;
+    for (;;) {
+      const char *q = scan_ch2(p, end, what[0], '\\');
+      if (q >= end || (size_t)(q - s.p) > lim) return -1;
+      if (*q == '\\' && q + 1 < end && md_escapable(q[1])) {
+        p = q + 2;
+        continue;
+      }
+      if (*q == what[0] && memcmp(q, what, wlen) == 0) return (long)(q - s.p);
+      p = q + 1;
+    }
+  }
   for (size_t j = from; j <= lim; j++) {
     if (s.p[j] == '\\' && j + 1 < s.len && md_escapable(s.p[j + 1])) {
       j++;
@@ -1782,42 +2081,37 @@ static long md_find_unescaped(Str s, const char *what, size_t wlen, size_t from)
 
 // The first single * from `from` (one whose run is not **), outside an escape, or -1.
 static long md_find_single_star(Str s, size_t from) {
-  for (size_t j = from; j < s.len; j++) {
-    char c = s.p[j];
-    if (c == '\\' && j + 1 < s.len && md_escapable(s.p[j + 1])) {
-      j++;
+  const char *p = s.p + from;
+  const char *end = s.p + s.len;
+  for (;;) {
+    const char *q = scan_ch2(p, end, '*', '\\');
+    if (q >= end) return -1;
+    if (*q == '\\') {
+      if (q + 1 < end && md_escapable(q[1])) p = q + 2;
+      else p = q + 1;
       continue;
     }
-    if (c != '*') continue;
-    if (j + 1 < s.len && s.p[j + 1] == '*') {
-      j++;
+    if (q + 1 < end && q[1] == '*') {
+      p = q + 2;
       continue;
     }
-    return (long)j;
+    return (long)(q - s.p);
   }
-  return -1;
 }
 
 static long md_index_of(Str s, char c, size_t from) {
-  for (size_t j = from; j < s.len; j++) {
-    if (s.p[j] == c) return (long)j;
-  }
-  return -1;
+  if (from > s.len) return -1;
+  const char *q = scan_ch(s.p + from, s.p + s.len, c);
+  return q >= s.p + s.len ? -1 : (long)(q - s.p);
 }
 
 static void md_inline(StrBuf *out, Str s, MdEnv *env);
 
 static void md_inline(StrBuf *out, Str s, MdEnv *env) {
-  // 1 for bytes that start inline markup or need escaping.
-  static const unsigned char special[256] = {
-    ['\\'] = 1, ['`'] = 1, ['*'] = 1, ['['] = 1,
-    ['&'] = 1, ['<'] = 1, ['>'] = 1, ['"'] = 1, ['\''] = 1,
-  };
   size_t i = 0;
   while (i < s.len) {
     // Bulk-copy the plain run up to the next special byte.
-    size_t j = i;
-    while (j < s.len && !special[(unsigned char)s.p[j]]) j++;
+    size_t j = (size_t)(scan_md(s.p + i, s.p + s.len) - s.p);
     if (j > i) {
       sb_putn(out, s.p + i, j - i);
       i = j;
@@ -1926,15 +2220,6 @@ static MdResult render_markdown(Str src, MdEnv *env) {
     }
     Str lang;
     if (md_fence_open(line, &lang)) {
-      StrBuf body;
-      sb_init(&body, 256);
-      i++;
-      while (i < ls.n && !md_fence_close(ls.lines[i])) {
-        sb_put_escaped_html(&body, ls.lines[i]);
-        sb_putc(&body, '\n');
-        i++;
-      }
-      i++; // past the closing fence (or past the end)
       sb_putn(&html, "<pre><code", 10);
       if (lang.len > 0) {
         sb_putn(&html, " class=\"language-", 17);
@@ -1942,7 +2227,13 @@ static MdResult render_markdown(Str src, MdEnv *env) {
         sb_putc(&html, '"');
       }
       sb_putc(&html, '>');
-      sb_puts(&html, sb_str(&body));
+      i++;
+      while (i < ls.n && !md_fence_close(ls.lines[i])) {
+        sb_put_escaped_html(&html, ls.lines[i]);
+        sb_putc(&html, '\n');
+        i++;
+      }
+      i++; // past the closing fence (or past the end)
       sb_putn(&html, "</code></pre>\n", 14);
       continue;
     }
@@ -2103,17 +2394,24 @@ static MdResult render_markdown(Str src, MdEnv *env) {
       sb_puts(&body, md_trim_line(ls.lines[i]));
       i++;
     }
-    StrBuf inner;
-    sb_init(&inner, body.len + 16);
-    md_inline(&inner, sb_str(&body), env);
-    Str phtml = sb_str(&inner);
+    Str body_s = sb_str(&body);
     if (!have_excerpt) {
-      r.excerpt = phtml;
+      // The first paragraph's HTML is the excerpt, so it needs its own buffer.
+      StrBuf inner;
+      sb_init(&inner, body.len + 16);
+      md_inline(&inner, body_s, env);
+      r.excerpt = sb_str(&inner);
       have_excerpt = 1;
+      sb_putn(&html, "<p>", 3);
+      sb_puts(&html, r.excerpt);
+      sb_putn(&html, "</p>\n", 5);
+    } else {
+      // Later paragraphs render straight into the page buffer: no second
+      // copy of their HTML and no throwaway buffer per paragraph.
+      sb_putn(&html, "<p>", 3);
+      md_inline(&html, body_s, env);
+      sb_putn(&html, "</p>\n", 5);
     }
-    sb_putn(&html, "<p>", 3);
-    sb_puts(&html, phtml);
-    sb_putn(&html, "</p>\n", 5);
   }
   r.html = sb_str(&html);
   return r;
@@ -2212,7 +2510,10 @@ static int tpl_path_of(Str name, Str text, Str **out_path, size_t *out_n, Str *e
 bad: {
   StrBuf m;
   sb_init(&m, 64);
-  json_write_str(&m, text);
+  Jw w;
+  jw_init(&w, &m);
+  json_write_str(&w, text);
+  jw_finish(&w);
   sb_lit(&m, " is not a path");
   *err = tpl_err(name, sb_str(&m));
   return 0;
@@ -2799,6 +3100,11 @@ struct Source {
   Tag **tag_refs;
   size_t ntag_refs;
   JVal *card; // built in layouts() for posts
+  // Card values, computed once per source before layouts() (a post's card is
+  // built twice — for its card and its page — so these must not be recomputed).
+  long reading_minutes;
+  Str date_long;
+  JVal *tags_jv;
 };
 
 typedef struct {
@@ -3048,7 +3354,7 @@ static JVal *link_of(Source *s) {
   jv_obj_setc(o, "title", jv_str(s->fm.title));
   jv_obj_setc(o, "url", jv_str(s->url));
   jv_obj_setc(o, "date", jv_str(s->fm.has_date ? s->fm.date : STR_EMPTY));
-  jv_obj_setc(o, "date_long", jv_str(s->fm.has_date ? long_date(s->fm.date) : STR_EMPTY));
+  jv_obj_setc(o, "date_long", jv_str(s->date_long));
   return o;
 }
 
@@ -3058,23 +3364,11 @@ static JVal *card_of(Source *s) {
   jv_obj_setc(o, "title", jv_str(s->fm.title));
   jv_obj_setc(o, "url", jv_str(s->url));
   jv_obj_setc(o, "date", jv_str(s->fm.has_date ? s->fm.date : STR_EMPTY));
-  jv_obj_setc(o, "date_long", jv_str(s->fm.has_date ? long_date(s->fm.date) : STR_EMPTY));
+  jv_obj_setc(o, "date_long", jv_str(s->date_long));
   jv_obj_setc(o, "summary", jv_str(s->fm.has_summary ? s->fm.summary : STR_EMPTY));
   jv_obj_setc(o, "excerpt", jv_str(s->excerpt));
-  long w = words_of(s->fm.body);
-  long mins = (w + 199) / 200;
-  if (mins < 1) mins = 1;
-  jv_obj_setc(o, "reading_minutes", jv_int(mins));
-  JVal *tags = jv_arr();
-  for (size_t i = 0; i < s->ntag_refs; i++) {
-    Tag *t = s->tag_refs[i];
-    JVal *e = jv_obj();
-    jv_obj_setc(e, "name", jv_str(t->name));
-    jv_obj_setc(e, "slug", jv_str(t->slug));
-    jv_obj_setc(e, "url", jv_str(t->url));
-    jv_arr_push(tags, e);
-  }
-  jv_obj_setc(o, "tags", tags);
+  jv_obj_setc(o, "reading_minutes", jv_int(s->reading_minutes));
+  jv_obj_setc(o, "tags", s->tags_jv);
   return o;
 }
 
@@ -3181,13 +3475,7 @@ static JVal *build_site(JVal *input) {
     if (str_ends_with(pv->s, S(".md"))) {
       // Line ends made "\n".
       Str text = cv->s;
-      int has_cr = 0;
-      for (size_t k = 0; k < text.len; k++) {
-        if (text.p[k] == '\r') {
-          has_cr = 1;
-          break;
-        }
-      }
+      int has_cr = scan_ch(text.p, text.p + text.len, '\r') < text.p + text.len;
       if (has_cr) {
         StrBuf nb;
         sb_init(&nb, text.len + 1);
@@ -3440,6 +3728,26 @@ static JVal *build_site(JVal *input) {
 
   PHASE("collections");
   // 7. Every page through its layout, the index pages and the tag pages through theirs.
+  // Per-source card values, computed once here: a post's card is built twice
+  // (for its card and its page), and the word count scans the whole body.
+  for (size_t i = 0; i < b.nsources; i++) {
+    Source *s = b.sources[i];
+    long w = words_of(s->fm.body);
+    long mins = (w + 199) / 200;
+    if (mins < 1) mins = 1;
+    s->reading_minutes = mins;
+    s->date_long = s->fm.has_date ? long_date(s->fm.date) : STR_EMPTY;
+    JVal *tags = jv_arr();
+    for (size_t k = 0; k < s->ntag_refs; k++) {
+      Tag *t = s->tag_refs[k];
+      JVal *e = jv_obj();
+      jv_obj_setc(e, "name", jv_str(t->name));
+      jv_obj_setc(e, "slug", jv_str(t->slug));
+      jv_obj_setc(e, "url", jv_str(t->url));
+      jv_arr_push(tags, e);
+    }
+    s->tags_jv = tags;
+  }
   for (size_t k = 0; k < b.nposts; k++) b.posts[k]->card = card_of(b.posts[k]);
   JVal *site = jv_obj();
   JVal *title_v = site_in != NULL ? jobj_getc(site_in, "title") : NULL;
@@ -3693,7 +4001,10 @@ static const char *render_all(const char *input_path, const char *output_path) {
   }
   StrBuf b;
   sb_init(&b, len * 3 + 65536); // the answers run ~2.5x the input; avoids growth copies
-  json_write_val(&b, answers);
+  Jw w;
+  jw_init(&w, &b);
+  json_write_val(&w, answers);
+  jw_finish(&w);
   if (arena_failed) return "arena exhausted";
   Str out_text = sb_str(&b);
   PHASE("json_write");
